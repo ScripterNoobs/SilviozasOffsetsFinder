@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""
+Python OffsetFinder for Silviozas AutoCrack.
+
+The important bit: PatchData bytes are the bytes to write, so searching those
+bytes directly is not enough for every line. By default this script derives the
+write offsets from PatchData and the target EXE only. PatchDataCompleted is
+accepted only when explicitly passed with -c for comparison/development.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -413,16 +422,68 @@ def fallback_strategies(pattern: Sequence[Optional[int]]) -> List[Strategy]:
     return strategies
 
 
-def direct_match_offsets(data: bytes, pattern: Sequence[Optional[int]]) -> Tuple[List[int], str]:
+def make_first_opcode_wildcard_pattern(pattern: Sequence[Optional[int]]) -> BytePattern:
+    variant = list(pattern)
+    if variant and variant[0] is not None and 0x70 <= variant[0] <= 0x7F:
+        variant[0] = None
+    return variant
+
+
+def direct_family_key(pattern: Sequence[Optional[int]]) -> str:
+    if is_counter_patch_pattern(pattern):
+        return "counter:" + pattern_key(make_relaxed_patch_pattern(pattern))
+    return "exact:" + pattern_key(pattern)
+
+
+def enough_matches(matches: Sequence[int], copies: int) -> bool:
+    return bool(matches) and (copies <= 0 or len(matches) >= copies)
+
+
+def direct_match_offsets(data: bytes, pattern: Sequence[Optional[int]], copies: int) -> Tuple[List[int], str]:
     exact = find_all(data, pattern)
-    if exact:
+    if enough_matches(exact, copies):
         return exact, "exact"
 
-    relaxed = make_relaxed_patch_pattern(pattern)
-    if pattern_key(relaxed) == pattern_key(pattern):
-        return [], "exact"
+    opcode_hits: List[int] = []
+    opcode_variant = make_first_opcode_wildcard_pattern(pattern)
+    if pattern_key(opcode_variant) != pattern_key(pattern):
+        opcode_hits = find_all(data, opcode_variant)
+        if enough_matches(opcode_hits, copies):
+            return opcode_hits, "jcc-opcode"
 
-    return find_all(data, relaxed), "relaxed"
+    relaxed = make_relaxed_patch_pattern(pattern)
+    if pattern_key(relaxed) != pattern_key(pattern):
+        relaxed_hits = find_all(data, relaxed)
+        if relaxed_hits:
+            return relaxed_hits, "relaxed"
+
+    if opcode_variant != list(pattern) and opcode_hits:
+        return opcode_hits, "jcc-opcode"
+    if exact:
+        return exact, "exact"
+    return [], "exact"
+
+
+def select_expected_copies(matches: Sequence[int], copies: int) -> List[int]:
+    matches = sorted(dict.fromkeys(matches))
+    if copies <= 0 or len(matches) <= copies:
+        return matches
+
+    gaps = [(matches[i + 1] - matches[i], i) for i in range(len(matches) - 1)]
+    split_indices = {index for _, index in sorted(gaps, reverse=True)[: copies - 1]}
+
+    clusters: List[List[int]] = [[]]
+    for index, match in enumerate(matches):
+        clusters[-1].append(match)
+        if index in split_indices and index != len(matches) - 1:
+            clusters.append([])
+
+    clusters = [cluster for cluster in clusters if cluster]
+    if len(clusters) == copies:
+        return [cluster[0] for cluster in clusters]
+
+    step = (len(matches) - 1) / float(copies - 1)
+    return [matches[round(step * index)] for index in range(copies)]
 
 
 def collect_candidates(target_data: bytes, strategies: Sequence[Strategy]) -> List[Candidate]:
@@ -585,7 +646,9 @@ def grouped_counter_indices(pattern_items: Sequence[Tuple[int, PatchLine]]) -> T
         for pattern_pos, (_, line) in enumerate(pattern_items)
         if is_counter_patch_pattern(line.pattern)
     ]
-    if len(counter_positions) < 2:
+    if len(counter_positions) == 1:
+        return len(pattern_items), counter_positions
+    if len(counter_positions) < 1:
         return 0, counter_positions
 
     diffs = [
@@ -677,7 +740,7 @@ def infer_offsets_without_completed(
     patch_lines: Sequence[PatchLine],
     expected_copies: int = 4,
     verbose: bool = False,
-) -> Dict[int, InferredOffset]:
+) -> Dict[int, List[InferredOffset]]:
     pattern_items = [
         (line_index, line)
         for line_index, line in enumerate(patch_lines)
@@ -692,22 +755,32 @@ def infer_offsets_without_completed(
     counter_base_deltas: List[int] = []
     counter_line_positions: List[int] = []
 
-    for occurrence, pattern_pos in enumerate(counter_positions):
+    def add_counter_occurrence(pattern_pos: int, source: int) -> None:
         line_index, line = pattern_items[pattern_pos]
-        relaxed_hits = cached_hits_for(data, line.pattern, hit_cache, relaxed=True)
-        valid_hits = [hit for hit in relaxed_hits if counter_source_abs(data, hit) is not None]
-        if occurrence >= len(valid_hits):
-            continue
-
-        source = valid_hits[occurrence]
         actual_disp = data_i32(data, source + 4)
         patch_disp = pattern_i32(line.pattern, 4)
         if actual_disp is None or patch_disp is None:
-            continue
+            return
 
         counter_sources.append(source)
         counter_base_deltas.append(actual_disp - patch_disp)
         counter_line_positions.append(pattern_pos)
+
+    if len(counter_positions) == 1:
+        pattern_pos = counter_positions[0]
+        _, line = pattern_items[pattern_pos]
+        relaxed_hits = cached_hits_for(data, line.pattern, hit_cache, relaxed=True)
+        valid_hits = [hit for hit in relaxed_hits if counter_source_abs(data, hit) is not None]
+        for source in valid_hits[:expected_copies]:
+            add_counter_occurrence(pattern_pos, source)
+    else:
+        for occurrence, pattern_pos in enumerate(counter_positions):
+            _, line = pattern_items[pattern_pos]
+            relaxed_hits = cached_hits_for(data, line.pattern, hit_cache, relaxed=True)
+            valid_hits = [hit for hit in relaxed_hits if counter_source_abs(data, hit) is not None]
+            if occurrence >= len(valid_hits):
+                continue
+            add_counter_occurrence(pattern_pos, valid_hits[occurrence])
 
     if not counter_sources:
         return {}
@@ -716,7 +789,7 @@ def infer_offsets_without_completed(
 
     global_shift = align_up(-min(counter_base_deltas), 0x1000)
     deltas = [base_delta + global_shift for base_delta in counter_base_deltas]
-    inferred: Dict[int, InferredOffset] = {}
+    inferred: Dict[int, List[InferredOffset]] = defaultdict(list)
 
     if verbose:
         abs_values = [counter_source_abs(data, source) for source in counter_sources]
@@ -728,11 +801,13 @@ def infer_offsets_without_completed(
 
     for occurrence, (pattern_pos, source, delta) in enumerate(zip(counter_line_positions, counter_sources, deltas)):
         line_index, _ = pattern_items[pattern_pos]
-        inferred[line_index] = InferredOffset(
-            offset=source + delta,
-            source=source,
-            strategy="counter-rip",
-            delta=delta,
+        inferred[line_index].append(
+            InferredOffset(
+                offset=source + delta,
+                source=source,
+                strategy="counter-rip",
+                delta=delta,
+            )
         )
 
         group_start = pattern_pos - (pattern_pos % group_size)
@@ -747,11 +822,13 @@ def infer_offsets_without_completed(
             previous_source = choose_previous_source(hits, source, occurrence)
             if previous_source is None:
                 continue
-            inferred[previous_line_index] = InferredOffset(
-                offset=previous_source + delta,
-                source=previous_source,
-                strategy="group-shift-before-counter",
-                delta=delta,
+            inferred[previous_line_index].append(
+                InferredOffset(
+                    offset=previous_source + delta,
+                    source=previous_source,
+                    strategy="group-shift-before-counter",
+                    delta=delta,
+                )
             )
 
         # Lines after the RIP-counter patch are selected by common relative
@@ -768,14 +845,16 @@ def infer_offsets_without_completed(
             if len(next_line.pattern) >= 7 and next_line.pattern[0:3] == [0x75, 0x05, 0xE9]:
                 lead_in = 0x54
 
-            inferred[next_line_index] = InferredOffset(
-                offset=source_anchor + delta - lead_in,
-                source=source_anchor,
-                strategy=f"group-branch-anchor-{relative:+X}",
-                delta=delta - lead_in,
+            inferred[next_line_index].append(
+                InferredOffset(
+                    offset=source_anchor + delta - lead_in,
+                    source=source_anchor,
+                    strategy=f"group-branch-anchor-{relative:+X}",
+                    delta=delta - lead_in,
+                )
             )
 
-    return inferred
+    return dict(inferred)
 
 
 def run(args: argparse.Namespace) -> int:
@@ -791,7 +870,7 @@ def run(args: argparse.Namespace) -> int:
     completed_offsets: Dict[str, List[int]] = {}
     if completed_path is not None and completed_path.is_file():
         completed_offsets = load_completed_offsets(completed_path)
-    inferred_offsets: Dict[int, InferredOffset] = {}
+    inferred_offsets: Dict[int, List[InferredOffset]] = {}
     if not completed_offsets:
         inferred_offsets = infer_offsets_without_completed(target_data, patch_lines, args.copies, args.verbose)
 
@@ -821,6 +900,7 @@ def run(args: argparse.Namespace) -> int:
     total_patterns = 0
     total_found = 0
     total_missing = 0
+    processed_direct_patterns = set()
 
     for index, line in enumerate(patch_lines, start=1):
         line_index = index - 1
@@ -843,23 +923,32 @@ def run(args: argparse.Namespace) -> int:
 
         total_patterns += 1
 
-        inferred = inferred_offsets.get(line_index)
-        if inferred is not None:
-            total_found += 1
-            found_offset = inferred.offset if args.patch_targets else inferred.source
-            output_lines.append(f"{format_offset(found_offset)}  {line.bytes_text}")
-            if args.verbose:
-                mode_text = "patch target" if args.patch_targets else "hex match"
-                print(
-                    f"[+] Line {index}: {format_offset(found_offset)}"
-                    f" ({mode_text}, {inferred.strategy}, source {format_offset(inferred.source)}, "
-                    f"patch {format_offset(inferred.offset)}, delta {inferred.delta:+X})"
-                )
+        inferred_list = inferred_offsets.get(line_index)
+        if inferred_list:
+            total_found += len(inferred_list)
+            for inferred in inferred_list:
+                found_offset = inferred.offset if args.patch_targets else inferred.source
+                output_lines.append(f"{format_offset(found_offset)}  {line.bytes_text}")
+                if args.verbose:
+                    mode_text = "patch target" if args.patch_targets else "hex match"
+                    print(
+                        f"[+] Line {index}: {format_offset(found_offset)}"
+                        f" ({mode_text}, {inferred.strategy}, source {format_offset(inferred.source)}, "
+                        f"patch {format_offset(inferred.offset)}, delta {inferred.delta:+X})"
+                    )
             continue
 
         if not args.patch_targets and not completed_offsets:
-            matches, match_kind = direct_match_offsets(target_data, line.pattern)
+            direct_key = direct_family_key(line.pattern)
+            if direct_key in processed_direct_patterns:
+                if args.verbose:
+                    print(f"[-] Line {index}: duplicate pattern family skipped")
+                continue
+            processed_direct_patterns.add(direct_key)
+
+            matches, match_kind = direct_match_offsets(target_data, line.pattern, args.copies)
             if matches:
+                matches = select_expected_copies(matches, args.copies)
                 total_found += len(matches)
                 for match_offset in matches:
                     output_lines.append(f"{format_offset(match_offset)}  {line.bytes_text}")
