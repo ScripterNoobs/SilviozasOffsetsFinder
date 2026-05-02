@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""
-Python OffsetFinder for Silviozas AutoCrack.
-
-The important bit: PatchData bytes are the bytes to write, so searching those
-bytes directly is not enough for every line. By default this script derives the
-write offsets from PatchData and the target EXE only. PatchDataCompleted is
-accepted only when explicitly passed with -c for comparison/development.
-"""
-
 from __future__ import annotations
 
 import argparse
